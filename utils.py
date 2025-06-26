@@ -6,6 +6,7 @@ import mplhep as hep
 import functools, random
 from copy import deepcopy
 from typing import List, Dict, Tuple
+
 hep.style.use(hep.style.CMS)
 
 
@@ -228,13 +229,6 @@ def plot_efficiency_mpl(
     return ax
 
 
-# ============================================================
-#  Trackster, merging helpers and scoring  (copy–paste once)
-# ============================================================
-import awkward as ak
-import functools, random
-from copy import deepcopy
-from typing import List, Dict, Tuple
 
 
 class Trackster:
@@ -288,9 +282,6 @@ class Trackster:
                 setattr(self, name, field)
         return self
 
-    # --------------------------------------------------------
-    # merge (returns NEW Trackster)
-    # --------------------------------------------------------
     @staticmethod
     def _ewmean(a1, w1, a2, w2):
         s = w1 + w2
@@ -330,40 +321,91 @@ class Trackster:
                 f"nlc={len(self.lc_indices)})")
 
 
+def compute_scores(sim_dict, reco_dict):
+    """
+    Return (score, sharedE) using only dict look-ups.
+    Assumes both dicts expose the keys written in `event_to_views`.
+    """
+    sim_idx   = sim_dict["vertices_indexes"]
+    sim_mult  = sim_dict["vertices_multiplicity"]
+    sim_Elist = sim_dict["vertices_energy"]
 
-# ------------------------------------------------------------
-# Sim ↔ Reco score and aggregator
-# ------------------------------------------------------------
-def compute_scores(sim_trk, reco_trk) -> Tuple[float, float]:
-    if not all(hasattr(sim_trk, f) for f in ("vertices_indexes",
-                                             "vertices_multiplicity",
-                                             "vertices_energy")):
-        raise AttributeError("sim_trk missing required vertices_* fields")
+    reco_set = set(reco_dict["vertices_indexes"])
 
     num = den = shared = 0.0
-    reco_set = set(reco_trk.vertices_indexes)
-
-    for lc, mult, E in zip(sim_trk.vertices_indexes,
-                           sim_trk.vertices_multiplicity,
-                           sim_trk.vertices_energy):
+    for lc, mult, E in zip(sim_idx, sim_mult, sim_Elist):
         f_s = 1.0 / mult if mult else 0.0
         f_r = 1.0 if lc in reco_set else 0.0
-        num += min((f_r - f_s)**2, f_s**2) * E**2
-        den += (f_s**2) * E**2
+        num   += min((f_r - f_s) ** 2, f_s ** 2) * E ** 2
+        den   += (f_s ** 2) * E ** 2
         shared += f_r * f_s * E
 
-    return round(num / den if den else 0.0, 8), round(shared, 8)
+    return (num / den if den else 0.0, shared)
+def build_lc_to_reco(reco_dicts):
+    """Return dict{LC → set(reco_idx)} for one event."""
+    idx_map = {}
+    for i_r, r in enumerate(reco_dicts):
+        for lc in r["vertices_indexes"]:
+            idx_map.setdefault(lc, set()).add(i_r)
+    return idx_map
+
+def score_numpy(sim, reco_set):
+    """
+    sim : dict view
+    reco_set : Python set of LC indices in this Reco
+    """
+    mask = np.fromiter(
+        (lc in reco_set for lc in sim["vertices_indexes"]),
+        dtype=bool,
+        count=len(sim["vertices_indexes"]),
+    )
+    if not mask.any():
+        return 1.0, 0.0
+
+    f_s   = 1.0 / np.asarray(sim["vertices_multiplicity"], dtype="f8")
+    E     = np.asarray(sim["vertices_energy"], dtype="f8")
+
+    f_r   = mask.astype("f8")          # 1 if LC in reco, else 0
+    num   = np.minimum((f_r - f_s)**2, f_s**2) * E**2
+    den   = (f_s**2) * E**2
+    shared= f_r * f_s * E
+
+    score  = num.sum() / den.sum() if den.sum() else 0.0
+    sharedE= shared.sum()
+    return float(score), float(sharedE)
 
 
-def compute_sim_to_reco_scores(sim_ev, merged_reco, *, best_only=False) -> List[Dict]:
-    results: List[Dict] = []
-    for i_sim in range(len(sim_ev.raw_energy)):
-        sim_trk = Trackster.from_event_all(sim_ev, i_sim)
+
+def event_to_views(event_rec):
+    """Return list[dict] with plain lists instead of Awkward sub-arrays."""
+    return [
+        {
+            "raw_energy":           event_rec.raw_energy[i],
+            "regressed_pt":         event_rec.raw_pt[i],
+            "barycenter_eta":       event_rec.barycenter_eta[i],
+            "barycenter_phi":       event_rec.barycenter_phi[i],
+            # ↓ convert to vanilla lists so len()/truth-test is cheap & safe
+            "vertices_indexes":     ak.to_list(event_rec.vertices_indexes[i]),
+            "vertices_energy":      ak.to_list(event_rec.vertices_energy[i]),
+            "vertices_multiplicity":ak.to_list(event_rec.vertices_multiplicity[i]),
+        }
+        for i in range(len(event_rec.raw_energy))
+    ]
+
+
+def compute_sim_to_reco_scores(sim_ev, reco_dicts, *, best_only=False):
+    sim_views   = event_to_views(sim_ev)
+    lc_to_reco  = build_lc_to_reco(reco_dicts)
+
+    results = []
+    for i_sim, s in enumerate(sim_views):
+        candidates = set.union(*[lc_to_reco.get(lc, set()) for lc in s["vertices_indexes"]]) \
+                     if s["vertices_indexes"] else set()
+
         best = None
-        for j_reco, reco_trk in enumerate(merged_reco):
-            score, shared = compute_scores(sim_trk, reco_trk)
-            row = dict(sim_idx=i_sim, reco_idx=j_reco,
-                       score=score, sharedE=shared)
+        for j_reco in candidates:
+            score, shared = score_numpy(s, set(reco_dicts[j_reco]["vertices_indexes"]))
+            row = dict(sim_idx=i_sim, reco_idx=j_reco, score=score, sharedE=shared)
             if best_only:
                 if best is None or score < best["score"]:
                     best = row
@@ -373,16 +415,20 @@ def compute_sim_to_reco_scores(sim_ev, merged_reco, *, best_only=False) -> List[
             results.append(best)
     return results
 
-def compute_reco_to_sim_scores(sim_ev, merged_reco, *, best_only=False) -> List[Dict]:
-    results: List[Dict] = []
-    for i_reco in range(len(merged_reco)):
-        reco_trk = merged_reco[i_reco]
+
+def compute_reco_to_sim_scores(sim_ev, reco_dicts, *, best_only=False):
+    sim_views   = event_to_views(sim_ev)
+    sim_lc_map  = build_lc_to_reco(sim_views)        # same helper works
+
+    results = []
+    for i_reco, r in enumerate(reco_dicts):
+        candidates = set.union(*[sim_lc_map.get(lc, set()) for lc in r["vertices_indexes"]]) \
+                     if r["vertices_indexes"] else set()
+
         best = None
-        for j_sim in range(len(sim_ev.raw_energy)):
-            sim_trk = Trackster.from_event_all(sim_ev, j_sim)
-            score, shared = compute_scores(reco_trk, sim_trk)
-            row = dict(reco_idx=i_reco, sim_idx=j_sim,
-                       score=score, sharedE=shared)
+        for j_sim in candidates:
+            score, shared = score_numpy(sim_views[j_sim], set(r["vertices_indexes"]))
+            row = dict(reco_idx=i_reco, sim_idx=j_sim, score=score, sharedE=shared)
             if best_only:
                 if best is None or score < best["score"]:
                     best = row
@@ -392,9 +438,6 @@ def compute_reco_to_sim_scores(sim_ev, merged_reco, *, best_only=False) -> List[
             results.append(best)
     return results
 
-# ----------------------------------------------------------------------
-# E.  Collect ONE big (values, passed) pair for *each* variable
-# ----------------------------------------------------------------------
 def aggregate_for_efficiency(
     simTrackstersCP,
     score_tables,                   # list[list[dict]]  (same len as above)
@@ -412,8 +455,8 @@ def aggregate_for_efficiency(
           "eta"   : (values_eta, passed_eta),
           "phi"   : (values_phi, passed_phi) }
     """
-    # initialise empty lists for each variable
-    out = {v: ([], []) for v in vars}   # maps var -> (values_list, passed_list)
+    
+    out = {v: ([], []) for v in vars} 
 
     for ev, rows in enumerate(score_tables):
         if len(rows) == 0:
@@ -435,10 +478,9 @@ def aggregate_for_efficiency(
             passed_flag = (row["sharedE"] / E) > score_threshold if E else False
 
             for v in vars:
-                out[v][0].append(getter[v]())     # value
-                out[v][1].append(passed_flag)     # pass/fail
+                out[v][0].append(getter[v]())
+                out[v][1].append(passed_flag)
 
-    # convert lists → NumPy arrays
     for v in vars:
         values, ok = out[v]
         out[v] = (np.asarray(values, dtype="f8"),
@@ -478,39 +520,30 @@ def aggregate_for_merge(
         if not rows:
             continue
 
-        # --------------------------------------------------------------
-        # 1) For this event, count how many Sim's give score>thr to each Reco
-        # --------------------------------------------------------------
         high_overlap_count = {}
         for r in rows:
             if r["score"] < score_threshold:
                 high_overlap_count[r["reco_idx"]] = \
                     high_overlap_count.get(r["reco_idx"], 0) + 1
 
-        # --------------------------------------------------------------
-        # 2) Flag each Reco as passed (True) / not (False)
-        # --------------------------------------------------------------
+
         passed_map = {idx: (cnt > 1) for idx, cnt in high_overlap_count.items()}
 
-        # --------------------------------------------------------------
-        # 3) Append variable values + pass flag to the global lists
-        # --------------------------------------------------------------
+
         for idx, trk in enumerate(reco_list):
             passed_flag = passed_map.get(idx, False)
 
             value_dict = {
-                "energy": trk.raw_energy,
-                "pt":     getattr(trk, "raw_pt",
-                         getattr(trk, "regressed_pt", np.nan)),
-                "eta":    abs(trk.barycenter_eta),
-                "phi":    trk.barycenter_phi,
+                "energy": trk["raw_energy"],
+                "pt":     trk.get("raw_pt", trk.get("regressed_pt", np.nan)),
+                "eta":    abs(trk["barycenter_eta"]),
+                "phi":    trk["barycenter_phi"],
             }
 
             for v in vars:
                 out[v][0].append(value_dict[v])
                 out[v][1].append(passed_flag)
 
-    # convert to NumPy arrays
     for v in vars:
         values, ok = out[v]
         out[v] = (np.asarray(values, dtype="f8"),
@@ -548,39 +581,30 @@ def aggregate_for_fake(
         if not rows:
             continue
 
-        # --------------------------------------------------------------
-        # 1) For this event, count how many Sim's give score>thr to each Reco
-        # --------------------------------------------------------------
         high_overlap_count = {}
         for r in rows:
             if r["score"] > score_threshold:
                 high_overlap_count[r["reco_idx"]] = \
                     high_overlap_count.get(r["reco_idx"], 0) + 1
 
-        # --------------------------------------------------------------
-        # 2) Flag each Reco as passed (True) / not (False)
-        # --------------------------------------------------------------
         passed_map = {idx: (cnt == 0) for idx, cnt in high_overlap_count.items()}
 
-        # --------------------------------------------------------------
-        # 3) Append variable values + pass flag to the global lists
-        # --------------------------------------------------------------
         for idx, trk in enumerate(reco_list):
             passed_flag = passed_map.get(idx, False)
 
             value_dict = {
-                "energy": trk.raw_energy,
-                "pt":     getattr(trk, "raw_pt",
-                         getattr(trk, "regressed_pt", np.nan)),
-                "eta":    abs(trk.barycenter_eta),
-                "phi":    trk.barycenter_phi,
+                "energy": trk["raw_energy"],
+                "pt":     trk.get("raw_pt", trk.get("regressed_pt", np.nan)),
+                "eta":    abs(trk["barycenter_eta"]),
+                "phi":    trk["barycenter_phi"],
             }
+
 
             for v in vars:
                 out[v][0].append(value_dict[v])
                 out[v][1].append(passed_flag)
 
-    # convert to NumPy arrays
+
     for v in vars:
         values, ok = out[v]
         out[v] = (np.asarray(values, dtype="f8"),
@@ -588,9 +612,6 @@ def aggregate_for_fake(
     return out
 
 
-# ------------------------------------------------------------
-#  Plot a 3 × 4 grid:  (efficiency | merge | fake) × (E, pT, η, φ)
-# ------------------------------------------------------------
 def plot_all_metrics(
     data_efficiency: dict,
     data_merged: dict,
@@ -608,18 +629,18 @@ def plot_all_metrics(
     out_file : str or None
         If given, save the figure (png/pdf/…).
     """
-    # ----- configuration -------------------------------------------------
+
     vars_cfg = [
         ("energy", np.linspace(5, 600, 50),  "Energy [GeV]"),
         ("pt",     np.linspace(2, 150, 25),  r"$p_{T}$  [GeV]"),
-        ("eta",    np.linspace(0, 3.2, 25),  r"|η|"),
+        ("eta",    np.linspace(1.7, 2.7, 25),  r"|η|"),
         ("phi",    np.linspace(-np.pi, np.pi, 25),  r"φ"),
     ]
 
     metrics = [
         ("Efficiency", data_efficiency, {"fmt": "o", "label": "Eff"}),
         ("Merged Rate", data_merged,    {"fmt": "s", "label": "Merged"}),
-        ("Fake Reco",   data_fake,      {"fmt": "D", "label": "Fake"}),
+        ("Fake Rate",   data_fake,      {"fmt": "D", "label": "Fake"}),
     ]
 
     # ----- figure layout -------------------------------------------------
@@ -645,7 +666,7 @@ def plot_all_metrics(
             )
 
             if row_idx == 0:
-                ax.set_title(xlabel)
+                ax.set_title(xlabel, fontsize = 16)
 
             if col_idx == 0:
                 ax.set_ylabel(metric_title)
