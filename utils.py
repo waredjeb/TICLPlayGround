@@ -676,6 +676,51 @@ def plot_all_metrics(
     if out_file:
         fig.savefig(out_file)
     plt.show()
+import numpy as np
+import awkward as ak
+
+def cluster_to_view(event_lc, lc_idx):
+    if np.isscalar(lc_idx):
+        idx_list = [int(lc_idx)]
+    else:
+        idx_list = list(lc_idx)
+
+    x = ak.to_numpy(event_lc.position_x[idx_list])
+    y = ak.to_numpy(event_lc.position_y[idx_list])
+    z = ak.to_numpy(event_lc.position_z[idx_list])
+    E = ak.to_numpy(event_lc.energy[idx_list])
+
+    E_sum = E.sum() if E.size else 0.0
+
+    if E_sum:
+        bx = np.average(x, weights=E)
+        by = np.average(y, weights=E)
+        bz = np.average(z, weights=E)
+    else:
+        bx = by = bz = 0.0
+
+    rho = np.hypot(bx, by) + 1e-9
+    eta = 0.5 * np.log((np.hypot(rho, bz) + bz) /
+                       (np.hypot(rho, bz) - bz + 1e-9))
+    phi = np.arctan2(by, bx)
+
+    return {
+        "raw_energy":            float(E_sum),
+        "regressed_pt":          float(E_sum / np.cosh(eta)) if E_sum else 0.0,
+        "barycenter_eta":        float(eta),
+        "barycenter_phi":        float(phi),
+        "vertices_indexes":      idx_list,
+        "vertices_energy":       E.tolist(),
+        "vertices_multiplicity": [1] * len(idx_list),
+    }
+
+def clue_clusters_to_reco_views(event_lc, cluster_points):
+    """
+    event_lc       : awkward record with LC arrays for this event
+    cluster_points : np.ndarray or list of (list | scalar) from cl.cluster_points
+    """
+    return [cluster_to_view(event_lc, cp) for cp in cluster_points]
+    
 
 
 
